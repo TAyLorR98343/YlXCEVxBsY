@@ -1,0 +1,202 @@
+version: "3.7"
+# https://docs.docker.com/compose/compose-file/
+
+x-common-variables: &common-variables
+  SIG_SECRET_KEY: JWTSecretKeyDontUseInProduction!
+  EXTERNAL_SIG_SECRET_KEY: JWTSecretKeyDontUseInProduction!
+  EXTERNAL_ENC_SECRET_KEY: JWTEncKeyDontUseInProduction666!
+  eureka.client.serviceUrl.defaultZone: http://registry:8080/eureka
+  eureka.instance.non-secure-port: 8080
+  eureka.client.enabled: 'true'
+  eureka.instance.preferIpAddress: 'false'
+  management.endpoints.web.exposure.include: info,health,beans,bindings,gateway,prometheus
+  SPRING_MAIN_BANNER-MODE: 'off'
+  management.endpoint.metrics.enabled: 'true'
+  management.endpoint.env.enabled: 'true'
+  management.metrics.export.prometheus.enabled: 'true'
+  management.endpoint.prometheus.enabled: 'true'
+  backbase.security.http.public-paths-configurer-enabled: 'true'
+  backbase.security.public.paths: '/actuator/**,/integration-api/**'
+  server.port: 8080
+  SPRING_ZIPKIN_ENABLED: 'true'
+  SPRING_ZIPKIN_BASEURL: 'http://zipkin:9411'
+  SPRING_SLEUTH_SAMPLER_PROBABILITY: 1
+
+x-database-variables: &database-variables
+  spring.liquibase.enabled: 'true'
+  spring.liquibase.change-log: "classpath:/db/changelog/db.changelog-persistence.xml"
+  spring.jpa.hibernate.ddl-auto: none
+  spring.datasource.username: root
+  spring.datasource.password: backbase
+  spring.datasource.driver-class-name: com.mysql.cj.jdbc.Driver
+  spring.jpa.database-platform: org.hibernate.dialect.MySQL5Dialect
+  spring.jpa.properties.hibernate.dialect: org.hibernate.dialect.MySQL5Dialect
+
+x-message-broker-variables: &message-broker-variables
+  spring.activemq.broker-url: tcp://message-broker:61616
+  spring.activemq.user: admin
+  spring.activemq.password: admin
+
+services:
+
+  message-broker:
+    image: rmohr/activemq:5.15.9-alpine
+    container_name: demo_activemq
+    privileged: true
+    ports:
+      - "61616:61616"
+      - "8161:8161"
+      - "5672:5672"
+      - "61613:61613"
+      - "1883:1883"
+      - "61614:61614"
+
+  mysql:
+    image: mysql:8.0.36
+    # Set max_allowed_packet to 512M for provisioning
+    command: --max-allowed-packet=512M --performance-schema=FALSE --transaction-isolation=READ-COMMITTED --init-connect='SET collation_connection=utf8_bin' --init-connect='SET NAMES utf8;' --character-set-server=utf8 --collation-server=utf8_bin --lower-case-table-names=2 --max-connections=500
+    container_name: demo_mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=backbase
+    ports:
+      - "3306:3306"
+    volumes:
+      - demo_mysql_data:/var/lib/mysql
+      - ./config/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  edge:
+    image: repo.backbase.com/backbase-docker-releases/edge:IPS-1.12.6.1
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *common-variables
+      gateway.actuator.user: admin
+      gateway.actuator.password: admin
+    links:
+      - registry
+      - token-converter
+
+  registry:
+    image: repo.backbase.com/backbase-docker-releases/registry:IPS-1.12.6.1
+    ports:
+      - "8761:8080"
+
+  token-converter:
+    image: repo.backbase.com/backbase-docker-releases/bb-authentication-token-converter-service:IPS-1.12.6.1
+    ports:
+      - "7779:8080"
+    environment:
+      <<: *common-variables
+    links:
+      - registry
+
+  auth:
+    image: repo.backbase.com/backbase-docker-releases/authentication-dev:IPS-1.12.6.1-no-production
+    ports:
+      - "7778:8080"
+    environment:
+      <<: *common-variables
+      <<: *message-broker-variables
+      AUTHENTICATION_USERS_RESOURCE: file:/etc/auth/backbase_users.json
+    volumes:
+      - ./config/auth/backbase_users.json:/etc/auth/backbase_users.json:ro
+    links:
+      - registry
+      - message-broker
+
+  product:
+    image: ghcr.io/backbase/golden-sample/product
+    ports:
+      - "9915:8080"
+    environment:
+      <<: *common-variables
+      <<: *database-variables
+      <<: *message-broker-variables
+      spring.datasource.url: jdbc:mysql://mysql:3306/product?cacheServerConfiguration=true&createDatabaseIfNotExist=true&useSSL=false
+      DB_HOST: mysql
+      SPRING_PROFILES_ACTIVE: ${COMPOSE_APP_PROFILE}
+    links:
+      - registry
+      - mysql
+
+  review:
+    image: ghcr.io/backbase/golden-sample/review
+    ports:
+      - "9916:8080"
+    environment:
+      <<: *common-variables
+      <<: *database-variables
+      <<: *message-broker-variables
+      spring.datasource.url: jdbc:mysql://mysql:3306/review?cacheServerConfiguration=true&createDatabaseIfNotExist=true&useSSL=false
+      DB_HOST: mysql
+      SPRING_PROFILES_ACTIVE: ${COMPOSE_APP_PROFILE}
+    links:
+      - registry
+      - mysql
+
+  store:
+    image: ghcr.io/backbase/golden-sample/store
+    ports:
+      - "9917:8080"
+    environment:
+      <<: *common-variables
+      <<: *message-broker-variables
+      backbase.product-service.service-id: product
+      backbase.review-service.service-id: review
+      SPRING_PROFILES_ACTIVE: ${COMPOSE_APP_PROFILE}
+      logging.level.com.backbase.buildingblocks.communication.http.InterServiceLogger: DEBUG
+    links:
+      - registry
+
+  prom:
+    image: prom/prometheus
+    volumes:
+      - ./config/performance/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command: "--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus"
+    ports:
+      - 9090:9090
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - '3000:3000'
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./config/performance/grafana-provisioning/:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=backbase
+
+  zipkin:
+    image: openzipkin/zipkin
+    container_name: zipkin
+    environment:
+      - STORAGE_TYPE=mem
+      # - STORAGE_TYPE=mysql
+      # - MYSQL_DB = dbs
+      # - MYSQL_HOST=mysql_zip
+    # - JAVA_OPTS=-Dlogging.level.zipkin=DEBUG
+    ports:
+      - 9411:9411
+    # depends_on:
+    #     - storage
+
+  swaggerui:
+    image: swaggerapi/swagger-ui
+    container_name: swaggerui
+    environment:
+      - SWAGGER_JSON=/foo/service-api.yaml
+    ports:
+      - 80:8080
+    volumes:
+      - ./review/src/main/resources:/foo
+
+
+volumes:
+  demo_mysql_data:
+  grafana-storage:
