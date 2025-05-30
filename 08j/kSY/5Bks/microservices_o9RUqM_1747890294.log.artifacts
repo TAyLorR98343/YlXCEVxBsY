@@ -28,7 +28,6 @@ dubbo-compiler
 dubbo-config
 dubbo-config-api
 dubbo-config-spring
-dubbo-config-spring6
 dubbo-configcenter
 dubbo-configcenter-file
 dubbo-configcenter-apollo
